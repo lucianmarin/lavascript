@@ -162,6 +162,39 @@ function findTopLevelToken(s: string, token: string, fromIdx: number = 0): numbe
     return -1;
 }
 
+function findTopLevelKeywordLs(s: string, kw: string, fromIdx: number = 0): number {
+    let depth = 0;
+    let quote = "";
+    for (let i = fromIdx; i + kw.length <= s.length; i++) {
+        const c = s[i];
+        if (quote) {
+            if (c === "\\" && i + 1 < s.length) i++;
+            else if (c === quote) quote = "";
+            continue;
+        }
+        if (c === '"' || c === "'" || c === "`") {
+            quote = c;
+            continue;
+        }
+        if (c === "(" || c === "[" || c === "{") depth++;
+        else if (c === ")" || c === "]" || c === "}") {
+            if (depth > 0) depth--;
+        } else if (depth === 0 && s.startsWith(kw, i)) {
+            const leftOk = i === 0 || !isIdentCont(s[i - 1]);
+            const rightOk = i + kw.length === s.length || !isIdentCont(s[i + kw.length]);
+            if (leftOk && rightOk) return i;
+        }
+    }
+    return -1;
+}
+
+interface LsTranslateCtx {
+    usedInHelper: boolean;
+    usedZipHelper: boolean;
+}
+
+const gLsCtx: LsTranslateCtx = { usedInHelper: false, usedZipHelper: false };
+
 /* -------------------------------------------------------------------------
  * Type Translation (LavaScript <-> TypeScript)
  * ------------------------------------------------------------------------- */
@@ -314,7 +347,77 @@ function emitRangeArrayTs(rangeArgs: string, loopVar: string): string | null {
     if (parts.length === 2) {
         return `Array.from({ length: ${parts[1]} - ${parts[0]} }, (_, ${loopVar}) => ${parts[0]} + ${loopVar})`;
     }
+    if (parts.length === 3) {
+        const [start, stop, step] = parts;
+        return `Array.from({ length: Math.max(0, Math.ceil((${stop} - (${start})) / (${step}))) }, (_, _i) => (${start}) + _i * (${step}))`;
+    }
     return null;
+}
+
+function translateCompIterTs(iterRaw: string, loopParam: string): string | null {
+    if (iterRaw.startsWith("range(") && findMatchingDelim(iterRaw, 5, "(", ")") === iterRaw.length - 1) {
+        return emitRangeArrayTs(iterRaw.slice(6, -1), loopParam);
+    }
+    if (iterRaw.startsWith("enumerate(") && findMatchingDelim(iterRaw, 9, "(", ")") === iterRaw.length - 1) {
+        return `[...${translateTokensLavaScriptToTs(iterRaw.slice(10, -1))}.entries()]`;
+    }
+    if (iterRaw.startsWith("reversed(") && findMatchingDelim(iterRaw, 8, "(", ")") === iterRaw.length - 1) {
+        return `[...${translateTokensLavaScriptToTs(iterRaw.slice(9, -1))}].reverse()`;
+    }
+    return translateTokensLavaScriptToTs(iterRaw);
+}
+
+interface CompClauseLs {
+    loopParam: string;
+    iterRaw: string;
+    conds: string[];
+}
+
+function parseCompClausesLs(afterFor: string): CompClauseLs[] | null {
+    const clauses: CompClauseLs[] = [];
+    let rest = afterFor.trim();
+    while (rest.length > 0) {
+        const inIdx = findTopLevelKeywordLs(rest, "in");
+        if (inIdx <= 0) return null;
+        let rawVar = rest.slice(0, inIdx).trim();
+        if (rawVar.includes(":")) rawVar = rawVar.slice(0, rawVar.indexOf(":")).trim();
+        if (!rawVar) return null;
+        let loopParam = rawVar;
+        if (rawVar.includes(",") && !(rawVar.startsWith("(") && rawVar.endsWith(")"))) {
+            loopParam = `([${rawVar}])`;
+        } else if (rawVar.startsWith("(") && rawVar.endsWith(")")) {
+            loopParam = `([${rawVar.slice(1, -1)}])`;
+        }
+
+        const afterIn = rest.slice(inIdx + 2).trim();
+        const nextFor = findTopLevelKeywordLs(afterIn, "for");
+        const segment = nextFor >= 0 ? afterIn.slice(0, nextFor).trim() : afterIn;
+        rest = nextFor >= 0 ? afterIn.slice(nextFor + 3).trim() : "";
+
+        // Split `iter [if cond1 [if cond2 ...]]`
+        const conds: string[] = [];
+        let segRest = segment;
+        let iterRaw = "";
+        const firstIf = findTopLevelKeywordLs(segRest, "if");
+        if (firstIf < 0) {
+            iterRaw = segRest.trim();
+        } else {
+            iterRaw = segRest.slice(0, firstIf).trim();
+            let condTail = segRest.slice(firstIf + 2).trim();
+            while (condTail.length > 0) {
+                const nextIf = findTopLevelKeywordLs(condTail, "if");
+                if (nextIf < 0) {
+                    conds.push(condTail);
+                    break;
+                }
+                conds.push(condTail.slice(0, nextIf).trim());
+                condTail = condTail.slice(nextIf + 2).trim();
+            }
+        }
+        if (!iterRaw) return null;
+        clauses.push({ loopParam, iterRaw, conds });
+    }
+    return clauses.length > 0 ? clauses : null;
 }
 
 export function tryTranslateComprehensionLavaScriptToTs(
@@ -334,39 +437,36 @@ export function tryTranslateComprehensionLavaScriptToTs(
     }
 
     const inner = s.slice(1, -1);
-    const forIdx = findTopLevelToken(inner, " for ");
-    if (forIdx < 0) return null;
+    const forIdx = findTopLevelKeywordLs(inner, "for");
+    if (forIdx <= 0) return null;
 
     const head = inner.slice(0, forIdx).trim();
-    const afterFor = inner.slice(forIdx + 5);
-    const inIdx = findTopLevelToken(afterFor, " in ");
-    if (inIdx < 0 || !head) return null;
+    const afterFor = inner.slice(forIdx + 3).trim();
+    if (!head || !afterFor) return null;
 
-    const ifIdx = findTopLevelToken(afterFor, " if ", inIdx + 4);
-    const rawVar = afterFor.slice(0, inIdx).trim();
-    const loopVar = rawVar.includes(":") ? rawVar.slice(0, rawVar.indexOf(":")).trim() : rawVar;
-    if (!loopVar) return null;
+    const clauses = parseCompClausesLs(afterFor);
+    if (!clauses) return null;
 
-    const iterRaw = (ifIdx >= 0 ? afterFor.slice(inIdx + 4, ifIdx) : afterFor.slice(inIdx + 4)).trim();
-    const condRaw = ifIdx >= 0 ? afterFor.slice(ifIdx + 4).trim() : null;
-    if (!iterRaw || (condRaw !== null && !condRaw)) return null;
-
-    let baseTs: string;
-    if (iterRaw.startsWith("range(") && findMatchingDelim(iterRaw, 5, "(", ")") === iterRaw.length - 1) {
-        const r = emitRangeArrayTs(iterRaw.slice(6, -1), loopVar);
-        if (!r) return null;
-        baseTs = r;
-    } else {
-        baseTs = translateTokensLavaScriptToTs(iterRaw);
-    }
-
-    if (condRaw !== null) {
-        baseTs += `.filter(${loopVar} => ${translateTokensLavaScriptToTs(condRaw)})`;
-    }
+    const buildMapped = (idx: number, leafExpr: string): string | null => {
+        const cl = clauses[idx];
+        const simpleVar = cl.loopParam.startsWith("([") ? "_item" : cl.loopParam;
+        const base = translateCompIterTs(cl.iterRaw, simpleVar);
+        if (base === null) return null;
+        let chain = base;
+        for (const cond of cl.conds) {
+            chain += `.filter(${cl.loopParam} => ${translateTokensLavaScriptToTs(cond)})`;
+        }
+        if (idx === clauses.length - 1) {
+            return `${chain}.map(${cl.loopParam} => ${leafExpr})`;
+        }
+        const innerChain = buildMapped(idx + 1, leafExpr);
+        if (innerChain === null) return null;
+        return `${chain}.flatMap(${cl.loopParam} => ${innerChain})`;
+    };
 
     if (isBracket) {
         const elemTs = translateTokensLavaScriptToTs(head);
-        return `${baseTs}.map(${loopVar} => ${elemTs})`;
+        return buildMapped(0, elemTs);
     }
 
     // Distinguish `{k: v for ...}` (dict/rec) from `{elem for ...}` (set)
@@ -402,10 +502,12 @@ export function tryTranslateComprehensionLavaScriptToTs(
         const t = (targetTypeLavaScript || "").trim();
         const isRecord = t.startsWith("rec[") || t.startsWith("Record<");
         const wrapper = isRecord ? "Object.fromEntries" : "new Map";
-        return `${wrapper}(${baseTs}.map(${loopVar} => [${keyTs}, ${valTs}]))`;
+        const mapped = buildMapped(0, `[${keyTs}, ${valTs}]`);
+        return mapped !== null ? `${wrapper}(${mapped})` : null;
     } else {
         const elemTs = translateTokensLavaScriptToTs(head);
-        return `new Set(${baseTs}.map(${loopVar} => ${elemTs}))`;
+        const mapped = buildMapped(0, elemTs);
+        return mapped !== null ? `new Set(${mapped})` : null;
     }
 }
 
@@ -530,10 +632,370 @@ function findLastTopLevelMethod(s: string, methodPrefix: string): number {
  * Token-Level Expression Translation (LavaScript <-> TypeScript)
  * ------------------------------------------------------------------------- */
 
+function hasTopLevelAssignOrSepLs(s: string): boolean {
+    let depth = 0;
+    let quote = "";
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (quote) {
+            if (c === "\\" && i + 1 < s.length) i++;
+            else if (c === quote) quote = "";
+            continue;
+        }
+        if (c === '"' || c === "'" || c === "`") quote = c;
+        else if (c === "(" || c === "[" || c === "{") depth++;
+        else if (c === ")" || c === "]" || c === "}") {
+            if (depth > 0) depth--;
+        } else if (depth === 0) {
+            if (c === "," || c === ";") return true;
+            if (c === "=") {
+                if (
+                    s[i + 1] === "=" ||
+                    s[i + 1] === ">" ||
+                    (i > 0 && ["=", "!", "<", ">", "+", "-", "*", "/", "%", "&", "|", "^"].includes(s[i - 1]))
+                ) {
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function splitTernaryLs(s: string): { tExpr: string; condExpr: string; fExpr: string } | null {
+    const ifIdx = findTopLevelKeywordLs(s, "if");
+    if (ifIdx <= 0) return null;
+    const rest = s.slice(ifIdx + 2);
+    const elseRel = findTopLevelKeywordLs(rest, "else");
+    if (elseRel <= 0) return null;
+    const tExpr = s.slice(0, ifIdx).trim();
+    const condExpr = rest.slice(0, elseRel).trim();
+    const fExpr = rest.slice(elseRel + 4).trim();
+    if (!tExpr || !condExpr || !fExpr) return null;
+    return { tExpr, condExpr, fExpr };
+}
+
+function scanLambdaEndLs(s: string, start: number): number {
+    let depth = 0;
+    let quote = "";
+    for (let i = start; i < s.length; i++) {
+        const c = s[i];
+        if (quote) {
+            if (c === "\\" && i + 1 < s.length) i++;
+            else if (c === quote) quote = "";
+            continue;
+        }
+        if (c === '"' || c === "'" || c === "`") quote = c;
+        else if (c === "(" || c === "[" || c === "{") depth++;
+        else if (c === ")" || c === "]" || c === "}") {
+            if (depth === 0) return i;
+            depth--;
+        } else if (c === "," && depth === 0) {
+            return i;
+        }
+    }
+    return s.length;
+}
+
+function translateLambdaLs(rest: string): { tsCode: string; consumed: number } | null {
+    let idx = 0;
+    while (idx < rest.length && rest[idx] === " ") idx++;
+    let paramsStr = "";
+    let retStr = "";
+    let bodyColon = -1;
+
+    if (idx < rest.length && rest[idx] === "(") {
+        const rp = findMatchingDelim(rest, idx, "(", ")");
+        if (rp < 0) return null;
+        paramsStr = rest.slice(idx + 1, rp);
+        let after = rp + 1;
+        while (after < rest.length && rest[after] === " ") after++;
+        if (rest.startsWith("->", after)) {
+            const colRel = findTopLevelToken(rest.slice(after + 2), ":");
+            if (colRel < 0) return null;
+            retStr = rest.slice(after + 2, after + 2 + colRel).trim();
+            bodyColon = after + 2 + colRel;
+        } else if (rest[after] === ":") {
+            bodyColon = after;
+        } else {
+            return null;
+        }
+    } else {
+        let depth = 0;
+        let quote = "";
+        let arrowIdx = -1;
+        const colons: number[] = [];
+        for (let k = idx; k < rest.length; k++) {
+            const c = rest[k];
+            if (quote) {
+                if (c === "\\" && k + 1 < rest.length) k++;
+                else if (c === quote) quote = "";
+                continue;
+            }
+            if (c === '"' || c === "'" || c === "`") quote = c;
+            else if (c === "(" || c === "[" || c === "{") depth++;
+            else if (c === ")" || c === "]" || c === "}") {
+                if (depth === 0) break;
+                depth--;
+            } else if (depth === 0) {
+                if (c === "-" && rest[k + 1] === ">") {
+                    arrowIdx = k;
+                    break;
+                }
+                if (c === ":") {
+                    colons.push(k);
+                }
+            }
+        }
+        if (arrowIdx >= 0) {
+            paramsStr = rest.slice(idx, arrowIdx).trim();
+            const colRel = findTopLevelToken(rest.slice(arrowIdx + 2), ":");
+            if (colRel < 0) return null;
+            retStr = rest.slice(arrowIdx + 2, arrowIdx + 2 + colRel).trim();
+            bodyColon = arrowIdx + 2 + colRel;
+        } else if (colons.length === 1) {
+            bodyColon = colons[0];
+            paramsStr = rest.slice(idx, bodyColon).trim();
+        } else if (colons.length >= 2) {
+            bodyColon = colons[colons.length - 1];
+            paramsStr = rest.slice(idx, bodyColon).trim();
+        } else {
+            return null;
+        }
+    }
+
+    const bodyStart = bodyColon + 1;
+    const bodyEnd = scanLambdaEndLs(rest, bodyStart);
+    const body = rest.slice(bodyStart, bodyEnd).trim();
+    if (!body) return null;
+
+    const tsParams = paramsStr
+        ? splitTopLevel(paramsStr, ",")
+              .map((p) => p.trim())
+              .filter((p) => p.length > 0)
+              .map((p) => {
+                  const ci = findTopLevelToken(p, ":");
+                  if (ci > 0) {
+                      return `${p.slice(0, ci).trim()}: ${translateTypeLavaScriptToTs(p.slice(ci + 1).trim())}`;
+                  }
+                  return p;
+              })
+              .join(", ")
+        : "";
+    const tsRet = retStr ? `: ${translateTypeLavaScriptToTs(retStr)}` : "";
+    const tsBody = translateTokensLavaScriptToTs(body);
+    return { tsCode: `(${tsParams})${tsRet} => ${tsBody}`, consumed: bodyEnd };
+}
+
+function trySplitChainedComparisonsLs(s: string): { operands: string[]; ops: string[] } | null {
+    const ops: string[] = [];
+    const operands: string[] = [];
+    let depth = 0;
+    let quote = "";
+    let last = 0;
+
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (quote) {
+            if (c === "\\" && i + 1 < s.length) i++;
+            else if (c === quote) quote = "";
+            continue;
+        }
+        if (c === '"' || c === "'" || c === "`") quote = c;
+        else if (c === "(" || c === "[" || c === "{") depth++;
+        else if (c === ")" || c === "]" || c === "}") {
+            if (depth > 0) depth--;
+        } else if (depth === 0) {
+            if ((c === "<" || c === ">") && s[i + 1] !== c && s[i - 1] !== c) {
+                if (c === ">" && i > 0 && (s[i - 1] === "-" || s[i - 1] === "=")) continue;
+                const op = s[i + 1] === "=" ? c + "=" : c;
+                operands.push(s.slice(last, i).trim());
+                ops.push(op);
+                i += op.length - 1;
+                last = i + 1;
+            } else if ((c === "=" || c === "!") && s[i + 1] === "=" && s[i + 2] !== "=") {
+                const op = c + "=";
+                operands.push(s.slice(last, i).trim());
+                ops.push(op);
+                i += 1;
+                last = i + 1;
+            } else if (c === "=" && s[i + 1] === "=" && s[i + 2] === "=") {
+                operands.push(s.slice(last, i).trim());
+                ops.push("===");
+                i += 2;
+                last = i + 1;
+            } else if (c === "!" && s[i + 1] === "=" && s[i + 2] === "=") {
+                operands.push(s.slice(last, i).trim());
+                ops.push("!==");
+                i += 2;
+                last = i + 1;
+            }
+        }
+    }
+    if (ops.length < 2) return null;
+    operands.push(s.slice(last).trim());
+    if (operands.some((o) => !o)) return null;
+    return { operands, ops };
+}
+
+function hasComparisonOpLs(s: string): boolean {
+    let depth = 0;
+    let quote = "";
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (quote) {
+            if (c === "\\" && i + 1 < s.length) i++;
+            else if (c === quote) quote = "";
+            continue;
+        }
+        if (c === '"' || c === "'" || c === "`") quote = c;
+        else if (c === "(" || c === "[" || c === "{") depth++;
+        else if (c === ")" || c === "]" || c === "}") {
+            if (depth > 0) depth--;
+        } else if (depth === 0) {
+            if (c === "<" || c === ">") {
+                if (c === ">" && i > 0 && (s[i - 1] === "-" || s[i - 1] === "=")) continue;
+                return true;
+            }
+            if ((c === "=" || c === "!") && s[i + 1] === "=") return true;
+        }
+    }
+    return (
+        findTopLevelKeywordLs(s, "in") >= 0 ||
+        findTopLevelKeywordLs(s, "is") >= 0
+    );
+}
+
+function translateFStringLs(inner: string): string {
+    let tpl = "`";
+    let i = 0;
+    while (i < inner.length) {
+        if (inner[i] === "\\" && i + 1 < inner.length) {
+            tpl += inner[i] + inner[i + 1];
+            i += 2;
+            continue;
+        }
+        if (inner[i] === "`") {
+            tpl += "\\`";
+            i++;
+            continue;
+        }
+        if (inner[i] === "{") {
+            if (inner[i + 1] === "{") {
+                tpl += "{";
+                i += 2;
+                continue;
+            }
+            const closeB = findMatchingDelim(inner, i, "{", "}");
+            if (closeB > i) {
+                const rawExpr = inner.slice(i + 1, closeB).trim();
+                // Check optional format specifier `:spec` outside nested parens/brackets
+                const colonIdx = findTopLevelToken(rawExpr, ":");
+                if (colonIdx > 0) {
+                    const exprPart = translateTokensLavaScriptToTs(rawExpr.slice(0, colonIdx).trim());
+                    const spec = rawExpr.slice(colonIdx + 1).trim();
+                    const fixedM = /^\.(\d+)f$/.exec(spec);
+                    if (fixedM) {
+                        tpl += `\${Number(${exprPart}).toFixed(${fixedM[1]})}`;
+                    } else if (spec === "d") {
+                        tpl += `\${Math.trunc(Number(${exprPart}))}`;
+                    } else if (spec === "x") {
+                        tpl += `\${Number(${exprPart}).toString(16)}`;
+                    } else if (spec === "X") {
+                        tpl += `\${Number(${exprPart}).toString(16).toUpperCase()}`;
+                    } else if (spec === "b") {
+                        tpl += `\${Number(${exprPart}).toString(2)}`;
+                    } else {
+                        tpl += `\${${exprPart}}`;
+                    }
+                } else {
+                    tpl += `\${${translateTokensLavaScriptToTs(rawExpr)}}`;
+                }
+                i = closeB + 1;
+                continue;
+            }
+        }
+        if (inner[i] === "}" && inner[i + 1] === "}") {
+            tpl += "}";
+            i += 2;
+            continue;
+        }
+        tpl += inner[i];
+        i++;
+    }
+    tpl += "`";
+    return tpl;
+}
+
 export function translateTokensLavaScriptToTs(s: string): string {
     const trimmed = s.trim();
     const comp = tryTranslateComprehensionLavaScriptToTs(trimmed);
     if (comp !== null && s === trimmed) return comp;
+
+    if (!hasTopLevelAssignOrSepLs(trimmed) && findTopLevelKeywordLs(trimmed, "lambda") < 0) {
+        const tern = splitTernaryLs(trimmed);
+        if (tern) {
+            return `(${translateTokensLavaScriptToTs(tern.condExpr)} ? ${translateTokensLavaScriptToTs(tern.tExpr)} : ${translateTokensLavaScriptToTs(tern.fExpr)})`;
+        }
+        const orIdx = findTopLevelKeywordLs(trimmed, "or");
+        if (orIdx > 0) {
+            return `${translateTokensLavaScriptToTs(trimmed.slice(0, orIdx).trim())} || ${translateTokensLavaScriptToTs(trimmed.slice(orIdx + 2).trim())}`;
+        }
+        const andIdx = findTopLevelKeywordLs(trimmed, "and");
+        if (andIdx > 0) {
+            return `${translateTokensLavaScriptToTs(trimmed.slice(0, andIdx).trim())} && ${translateTokensLavaScriptToTs(trimmed.slice(andIdx + 3).trim())}`;
+        }
+        const afterNot = startsWithKw(trimmed, "not");
+        if (afterNot !== null && afterNot !== "") {
+            const inIdx = findTopLevelKeywordLs(afterNot, "in");
+            if (inIdx > 0) {
+                gLsCtx.usedInHelper = true;
+                return `!_lsIn(${translateTokensLavaScriptToTs(afterNot.slice(inIdx + 2).trim())}, ${translateTokensLavaScriptToTs(afterNot.slice(0, inIdx).trim())})`;
+            }
+            if (hasComparisonOpLs(afterNot)) {
+                return `!(${translateTokensLavaScriptToTs(afterNot.trim())})`;
+            }
+        }
+        const notIdx = findTopLevelKeywordLs(trimmed, "not");
+        if (notIdx > 0) {
+            const afterN = trimmed.slice(notIdx + 3).trim();
+            const inAfter = startsWithKw(afterN, "in");
+            if (inAfter !== null && inAfter !== "") {
+                gLsCtx.usedInHelper = true;
+                return `!_lsIn(${translateTokensLavaScriptToTs(inAfter.trim())}, ${translateTokensLavaScriptToTs(trimmed.slice(0, notIdx).trim())})`;
+            }
+        }
+        const inIdx = findTopLevelKeywordLs(trimmed, "in");
+        if (inIdx > 0) {
+            gLsCtx.usedInHelper = true;
+            return `_lsIn(${translateTokensLavaScriptToTs(trimmed.slice(inIdx + 2).trim())}, ${translateTokensLavaScriptToTs(trimmed.slice(0, inIdx).trim())})`;
+        }
+        const isIdx = findTopLevelKeywordLs(trimmed, "is");
+        if (isIdx > 0) {
+            const rhs = trimmed.slice(isIdx + 2).trim();
+            const notRhs = startsWithKw(rhs, "not");
+            if (notRhs !== null && notRhs !== "") {
+                return `${translateTokensLavaScriptToTs(trimmed.slice(0, isIdx).trim())} !== ${translateTokensLavaScriptToTs(notRhs.trim())}`;
+            }
+            return `${translateTokensLavaScriptToTs(trimmed.slice(0, isIdx).trim())} === ${translateTokensLavaScriptToTs(rhs)}`;
+        }
+        const chained = trySplitChainedComparisonsLs(trimmed);
+        if (chained) {
+            const parts: string[] = [];
+            for (let k = 0; k < chained.ops.length; k++) {
+                const op = chained.ops[k] === "==" ? "===" : chained.ops[k] === "!=" ? "!==" : chained.ops[k];
+                parts.push(
+                    `(${translateTokensLavaScriptToTs(chained.operands[k].trim())} ${op} ${translateTokensLavaScriptToTs(chained.operands[k + 1].trim())})`
+                );
+            }
+            return parts.join(" && ");
+        }
+        const floorIdx = findTopLevelToken(trimmed, "//");
+        if (floorIdx > 0) {
+            return `Math.floor((${translateTokensLavaScriptToTs(trimmed.slice(0, floorIdx).trim())}) / (${translateTokensLavaScriptToTs(trimmed.slice(floorIdx + 2).trim())}))`;
+        }
+    }
 
     let out = "";
     let i = 0;
@@ -581,6 +1043,56 @@ export function translateTokensLavaScriptToTs(s: string): string {
             continue;
         }
 
+        // Handle parenthesized subexpressions/call argument lists containing ternary/`in`/`is`/chained/floor
+        if (c === "(") {
+            const closeP = findMatchingDelim(s, i, "(", ")");
+            if (closeP > i) {
+                const inner = s.slice(i + 1, closeP);
+                const prevCh = i > 0 ? s[i - 1] : "";
+                const isCall = prevCh !== "" && (isIdentCont(prevCh) || prevCh === ")" || prevCh === "]");
+                if (
+                    isCall &&
+                    findTopLevelKeywordLs(inner, "lambda") < 0 &&
+                    (findTopLevelKeywordLs(inner, "if") >= 0 ||
+                        findTopLevelKeywordLs(inner, "in") >= 0 ||
+                        findTopLevelKeywordLs(inner, "is") >= 0 ||
+                        findTopLevelToken(inner, "//") >= 0)
+                ) {
+                    const args = splitTopLevel(inner, ",").map((a) => translateTokensLavaScriptToTs(a.trim()));
+                    out += `(${args.join(", ")})`;
+                    i = closeP + 1;
+                    continue;
+                }
+            }
+        }
+
+        // Handle Pythonic negative indexing `xs[-1]` and slicing `xs[a:b]` / `xs[::-1]`
+        if (c === "[" && i > 0 && (isIdentCont(s[i - 1]) || s[i - 1] === ")" || s[i - 1] === "]")) {
+            const closeB = findMatchingDelim(s, i, "[", "]");
+            if (closeB > i) {
+                const idxInner = s.slice(i + 1, closeB).trim();
+                if (idxInner.includes(":")) {
+                    const sliceParts = splitTopLevel(idxInner, ":", false);
+                    if (sliceParts.length === 2) {
+                        const a = sliceParts[0].trim() ? translateTokensLavaScriptToTs(sliceParts[0].trim()) : "0";
+                        const b = sliceParts[1].trim() ? `, ${translateTokensLavaScriptToTs(sliceParts[1].trim())}` : "";
+                        out += `.slice(${a}${b})`;
+                        i = closeB + 1;
+                        continue;
+                    }
+                    if (sliceParts.length === 3 && !sliceParts[0].trim() && !sliceParts[1].trim() && sliceParts[2].trim() === "-1") {
+                        out += `.slice().reverse()`;
+                        i = closeB + 1;
+                        continue;
+                    }
+                } else if (/^-\d+$/.test(idxInner)) {
+                    out += `.at(${idxInner})`;
+                    i = closeB + 1;
+                    continue;
+                }
+            }
+        }
+
         if (isIdentStart(c)) {
             const start = i;
             while (i < s.length && isIdentCont(s[i])) i++;
@@ -588,35 +1100,84 @@ export function translateTokensLavaScriptToTs(s: string): string {
             const isMember = start > 0 && s[start - 1] === ".";
 
             if (!isMember) {
+                // `lambda ...: ...`
+                if (word === "lambda" && i < s.length && (s[i] === " " || s[i] === "(" || s[i] === ":")) {
+                    const lam = translateLambdaLs(s.slice(i));
+                    if (lam) {
+                        out += lam.tsCode;
+                        i += lam.consumed;
+                        continue;
+                    }
+                }
+
                 // `f"Hello {name}"` -> `` `Hello ${name}` ``
                 if (word === "f" && i < s.length && (s[i] === '"' || s[i] === "'")) {
                     const quote = s[i];
                     i++;
-                    let tpl = "`";
+                    const bodyStart = i;
                     while (i < s.length && s[i] !== quote) {
-                        if (s[i] === "\\" && i + 1 < s.length) {
-                            tpl += s[i] + s[i + 1];
-                            i += 2;
+                        if (s[i] === "\\" && i + 1 < s.length) i += 2;
+                        else i++;
+                    }
+                    const fInner = s.slice(bodyStart, i);
+                    if (i < s.length && s[i] === quote) i++;
+                    out += translateFStringLs(fInner);
+                    continue;
+                }
+
+                // `isinstance(x, Type)`
+                if (word === "isinstance" && i < s.length && s[i] === "(") {
+                    const closeP = findMatchingDelim(s, i, "(", ")");
+                    if (closeP > i) {
+                        const args = splitTopLevel(s.slice(i + 1, closeP), ",");
+                        if (args.length === 2) {
+                            const exprTs = translateTokensLavaScriptToTs(args[0].trim());
+                            const rawT = args[1].trim();
+                            if (rawT === "str" || rawT === "string") {
+                                out += `(typeof ${exprTs} === "string")`;
+                            } else if (rawT === "num" || rawT === "number") {
+                                out += `(typeof ${exprTs} === "number")`;
+                            } else if (rawT === "bool" || rawT === "boolean") {
+                                out += `(typeof ${exprTs} === "boolean")`;
+                            } else if (rawT === "list" || rawT === "Array") {
+                                out += `Array.isArray(${exprTs})`;
+                            } else {
+                                out += `(${exprTs} instanceof ${translateTypeLavaScriptToTs(rawT)})`;
+                            }
+                            i = closeP + 1;
                             continue;
                         }
-                        if (s[i] === "{") {
-                            const closeB = findMatchingDelim(s, i, "{", "}");
-                            if (closeB > i) {
-                                const innerExpr = translateTokensLavaScriptToTs(
-                                    s.slice(i + 1, closeB).trim()
-                                );
-                                tpl += "${" + innerExpr + "}";
-                                i = closeB + 1;
-                                continue;
-                            }
-                        }
-                        tpl += s[i];
-                        i++;
                     }
-                    if (i < s.length && s[i] === quote) i++;
-                    tpl += "`";
-                    out += tpl;
-                    continue;
+                }
+
+                // `zip(a, b)` -> `_lsZip(a, b)` and `reversed(xs)` -> `[...xs].reverse()`
+                if (word === "zip" && i < s.length && s[i] === "(") {
+                    const closeP = findMatchingDelim(s, i, "(", ")");
+                    if (closeP > i) {
+                        gLsCtx.usedZipHelper = true;
+                        const args = splitTopLevel(s.slice(i + 1, closeP), ",").map((a) =>
+                            translateTokensLavaScriptToTs(a.trim())
+                        );
+                        out += `_lsZip(${args.join(", ")})`;
+                        i = closeP + 1;
+                        continue;
+                    }
+                }
+                if (word === "reversed" && i < s.length && s[i] === "(") {
+                    const closeP = findMatchingDelim(s, i, "(", ")");
+                    if (closeP > i) {
+                        out += `[...${translateTokensLavaScriptToTs(s.slice(i + 1, closeP).trim())}].reverse()`;
+                        i = closeP + 1;
+                        continue;
+                    }
+                }
+                if (word === "enumerate" && i < s.length && s[i] === "(") {
+                    const closeP = findMatchingDelim(s, i, "(", ")");
+                    if (closeP > i) {
+                        out += `[...${translateTokensLavaScriptToTs(s.slice(i + 1, closeP).trim())}.entries()]`;
+                        i = closeP + 1;
+                        continue;
+                    }
                 }
 
                 // `cast(Type, expr)` -> `(expr as Type)`
@@ -868,11 +1429,201 @@ export function translateTokensTsToLavaScript(s: string): string {
  * LavaScript -> TypeScript Transpiler
  * ------------------------------------------------------------------------- */
 
-type BlockKind = "normal" | "class" | "interface" | "enum" | "switch" | "case";
+type BlockKind = "normal" | "class" | "interface" | "enum" | "switch" | "case" | "with";
 
 interface BlockFrame {
     level: number;
     kind: BlockKind;
+    withVar?: string;
+    fnLineIdx?: number;
+}
+
+interface LogicalLineLs {
+    lineNo: number;
+    raw: string;
+}
+
+function preprocessLogicalLinesLs(src: string): LogicalLineLs[] {
+    const rawLines = src.split(/\r\n|\r|\n/);
+    if (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") {
+        rawLines.pop();
+    }
+
+    const result: LogicalLineLs[] = [];
+    let curLineNo = 0;
+    let acc = "";
+    let parenDepth = 0;
+    let continued = false;
+    let tripleQuote = ""; // '"""' or "'''"
+    let tripleF = false;
+    let tripleBody = "";
+
+    const updateDepth = (code: string) => {
+        let q = "";
+        for (let i = 0; i < code.length; i++) {
+            const c = code[i];
+            if (q) {
+                if (c === "\\" && i + 1 < code.length) i++;
+                else if (c === q) q = "";
+                continue;
+            }
+            if (c === '"' || c === "'" || c === "`") {
+                q = c;
+                continue;
+            }
+            if (c === "(" || c === "[" || c === "{") parenDepth++;
+            else if (c === ")" || c === "]" || c === "}") {
+                if (parenDepth > 0) parenDepth--;
+            }
+        }
+    };
+
+    const escapeSingleLineStr = (body: string, isF: boolean): string => {
+        let out = isF ? 'f"' : '"';
+        for (let i = 0; i < body.length; i++) {
+            const c = body[i];
+            if (c === "\n") out += "\\n";
+            else if (c === '"') out += '\\"';
+            else out += c;
+        }
+        return out + '"';
+    };
+
+    const findTripleStart = (s: string): { idx: number; delim: string; isF: boolean } | null => {
+        let q = "";
+        for (let i = 0; i < s.length; i++) {
+            const c = s[i];
+            if (q) {
+                if (c === "\\" && i + 1 < s.length) i++;
+                else if (c === q) q = "";
+                continue;
+            }
+            if (c === "#" && (i === 0 || s[i - 1] === " " || s[i - 1] === "\t")) break;
+            if (s.startsWith('f"""', i) && (i === 0 || !isIdentCont(s[i - 1]))) {
+                return { idx: i, delim: '"""', isF: true };
+            }
+            if (s.startsWith("f'''", i) && (i === 0 || !isIdentCont(s[i - 1]))) {
+                return { idx: i, delim: "'''", isF: true };
+            }
+            if (s.startsWith('"""', i)) return { idx: i, delim: '"""', isF: false };
+            if (s.startsWith("'''", i)) return { idx: i, delim: "'''", isF: false };
+            if (c === '"' || c === "'" || c === "`") q = c;
+        }
+        return null;
+    };
+
+    const collapseSameLineTriple = (s: string): string => {
+        let cur = s;
+        for (;;) {
+            const ts = findTripleStart(cur);
+            if (!ts) break;
+            const startOffset = ts.idx + (ts.isF ? 4 : 3);
+            const closeIdx = cur.indexOf(ts.delim, startOffset);
+            if (closeIdx < 0) break;
+            const lit = escapeSingleLineStr(cur.slice(startOffset, closeIdx), ts.isF);
+            cur = cur.slice(0, ts.idx) + lit + cur.slice(closeIdx + 3);
+        }
+        return cur;
+    };
+
+    for (let idx = 0; idx < rawLines.length; idx++) {
+        const lineNo = idx + 1;
+        let line = rawLines[idx];
+
+        if (tripleQuote) {
+            const closeIdx = line.indexOf(tripleQuote);
+            if (closeIdx >= 0) {
+                tripleBody += "\n" + line.slice(0, closeIdx);
+                const rest = line.slice(closeIdx + 3);
+                acc += escapeSingleLineStr(tripleBody, tripleF) + collapseSameLineTriple(rest);
+                tripleQuote = "";
+                tripleBody = "";
+                const { code } = splitCommentLavaScript(acc.trimStart());
+                parenDepth = 0;
+                updateDepth(code);
+                continued = acc.endsWith("\\");
+                if (continued) {
+                    acc = acc.slice(0, -1).trimEnd() + " ";
+                } else if (parenDepth === 0) {
+                    result.push({ lineNo: curLineNo, raw: acc });
+                    acc = "";
+                }
+            } else {
+                tripleBody += "\n" + line;
+            }
+            continue;
+        }
+
+        if (parenDepth === 0 && !continued) {
+            if (line.trim().length === 0) {
+                result.push({ lineNo, raw: line });
+                continue;
+            }
+            if (line.endsWith(" ") || line.endsWith("\t")) {
+                throw new LavaScriptSyntaxError(
+                    "trailing whitespace is forbidden on non-blank lines",
+                    lineNo,
+                    line.length
+                );
+            }
+            curLineNo = lineNo;
+        }
+
+        line = collapseSameLineTriple(line);
+        const ts = findTripleStart(line);
+        if (ts) {
+            const startOffset = ts.idx + (ts.isF ? 4 : 3);
+            const prefix = line.slice(0, ts.idx);
+            acc = acc ? acc + " " + prefix.trimStart() : prefix;
+            tripleQuote = ts.delim;
+            tripleF = ts.isF;
+            tripleBody = line.slice(startOffset);
+            continue;
+        }
+
+        const chunk = parenDepth > 0 || continued ? line.trim() : line;
+        if (parenDepth > 0 || continued) {
+            const { code } = splitCommentLavaScript(chunk);
+            if (code.endsWith("\\")) {
+                acc += " " + code.slice(0, -1).trimEnd();
+                continued = true;
+                continue;
+            }
+            continued = false;
+            acc = acc.endsWith("(") || acc.endsWith("[") || acc.endsWith("{")
+                ? acc + code
+                : acc + (code ? " " + code : "");
+            parenDepth = 0;
+            updateDepth(splitCommentLavaScript(acc.trimStart()).code);
+            if (parenDepth === 0) {
+                result.push({ lineNo: curLineNo, raw: acc });
+                acc = "";
+            }
+            continue;
+        }
+
+        const { code, comment } = splitCommentLavaScript(chunk.trimStart());
+        if (comment === null && chunk.endsWith("\\")) {
+            acc = chunk.slice(0, -1).trimEnd();
+            continued = true;
+            continue;
+        }
+        updateDepth(code);
+        if (parenDepth > 0) {
+            const wsLen = chunk.length - chunk.trimStart().length;
+            acc = chunk.slice(0, wsLen) + code;
+        } else {
+            result.push({ lineNo, raw: line });
+        }
+    }
+
+    if (tripleQuote) {
+        throw new LavaScriptSyntaxError("unterminated triple-quoted string", curLineNo, 1);
+    }
+    if (acc) {
+        result.push({ lineNo: curLineNo, raw: acc });
+    }
+    return result;
 }
 
 function splitCommentLavaScript(line: string): { code: string; comment: string | null } {
@@ -919,10 +1670,20 @@ function emitFunctionHeaderLavaScriptToTs(
         if (!matched) break;
     }
 
-    let rest = startsWithKw(s, "def");
-    if (rest === null) rest = startsWithKw(s, "fn");
+    let isGenerator = false;
+    let rest = startsWithKw(s, "def*");
+    if (rest !== null) {
+        isGenerator = true;
+    } else {
+        rest = startsWithKw(s, "def");
+        if (rest === null) rest = startsWithKw(s, "fn");
+    }
     if (rest === null) return null;
     s = rest;
+    if (s.startsWith("*")) {
+        isGenerator = true;
+        s = s.slice(1).trimStart();
+    }
 
     const lparen = s.indexOf("(");
     if (lparen <= 0) return null;
@@ -969,26 +1730,27 @@ function emitFunctionHeaderLavaScriptToTs(
         }
     }
 
+    const star = isGenerator ? "*" : "";
     if (inClass) {
         if (rawName === "__init__" || rawName === "constructor") {
             return `constructor(${tsParams.join(", ")}) {`;
         }
         const pre = prefixes.length > 0 ? `${prefixes.join(" ")} ` : "";
-        return `${pre}${rawName}${generics}(${tsParams.join(", ")})${retTs} {`;
+        return `${pre}${star}${rawName}${generics}(${tsParams.join(", ")})${retTs} {`;
     }
 
     const pre = prefixes.length > 0 ? `${prefixes.join(" ")} ` : "";
-    return `${pre}function ${rawName}${generics}(${tsParams.join(", ")})${retTs} {`;
+    return `${pre}function${star} ${rawName}${generics}(${tsParams.join(", ")})${retTs} {`;
 }
 
 function emitForInLavaScriptToTs(clause: string): string {
-    const inIdx = findTopLevelToken(clause, " in ");
+    const inIdx = findTopLevelKeywordLs(clause, "in");
     if (inIdx < 0) {
         return `for (${translateTokensLavaScriptToTs(clause)}) {`;
     }
     const rawVar = clause.slice(0, inIdx).trim();
     const vname = rawVar.includes(":") ? rawVar.slice(0, rawVar.indexOf(":")).trim() : rawVar;
-    const iter = clause.slice(inIdx + 4).trim();
+    const iter = clause.slice(inIdx + 2).trim();
 
     if (iter.startsWith("range(") && findMatchingDelim(iter, 5, "(", ")") === iter.length - 1) {
         const args = splitTopLevel(iter.slice(6, -1), ",").map((a) =>
@@ -1012,7 +1774,17 @@ function emitForInLavaScriptToTs(clause: string): string {
         }
     }
 
-    return `for (const ${vname} of ${translateTokensLavaScriptToTs(iter)}) {`;
+    const destruct =
+        vname.includes(",") && !(vname.startsWith("[") && vname.endsWith("]"))
+            ? `[${vname.replace(/^\(|\)$/g, "").trim()}]`
+            : vname;
+
+    if (iter.startsWith("enumerate(") && findMatchingDelim(iter, 9, "(", ")") === iter.length - 1) {
+        const inner = translateTokensLavaScriptToTs(iter.slice(10, -1).trim());
+        return `for (const ${destruct} of ${inner}.entries()) {`;
+    }
+
+    return `for (const ${destruct} of ${translateTokensLavaScriptToTs(iter)}) {`;
 }
 
 export function lavascriptToTs(src: string, tsIndent: string = "    "): string {
@@ -1020,10 +1792,10 @@ export function lavascriptToTs(src: string, tsIndent: string = "    "): string {
         throw new LavaScriptSyntaxError("UTF-8 BOM (U+FEFF) is forbidden at start of file", 1, 1);
     }
 
-    const rawLines = src.split(/\r\n|\r|\n/);
-    if (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") {
-        rawLines.pop();
-    }
+    gLsCtx.usedInHelper = false;
+    gLsCtx.usedZipHelper = false;
+
+    const logicalLines = preprocessLogicalLinesLs(src);
 
     let indentChar = "";
     let indentWidth = 0;
@@ -1035,12 +1807,20 @@ export function lavascriptToTs(src: string, tsIndent: string = "    "): string {
 
     const closeFrame = (frame: BlockFrame) => {
         if (frame.kind === "case") return;
+        if (frame.kind === "with") {
+            if (frame.withVar) {
+                outLines.push(`${tsIndent.repeat(frame.level + 1)}} finally {`);
+                outLines.push(`${tsIndent.repeat(frame.level + 2)}(${frame.withVar} as any)?.close?.();`);
+                outLines.push(`${tsIndent.repeat(frame.level + 1)}}`);
+            }
+            outLines.push(`${tsIndent.repeat(frame.level)}}`);
+            return;
+        }
         outLines.push(`${tsIndent.repeat(frame.level)}}`);
     };
 
-    for (let idx = 0; idx < rawLines.length; idx++) {
-        const lineNo = idx + 1;
-        const raw = rawLines[idx];
+    for (let idx = 0; idx < logicalLines.length; idx++) {
+        const { lineNo, raw } = logicalLines[idx];
 
         // Count leading spaces / tabs
         let ws = 0;
@@ -1139,6 +1919,12 @@ export function lavascriptToTs(src: string, tsIndent: string = "    "): string {
             continue;
         }
 
+        // `@Decorator` (without trailing `:`) -> emit without semicolon
+        if (code.startsWith("@") && !code.endsWith(":")) {
+            outLines.push(`${tsIndent.repeat(level)}${translateTokensLavaScriptToTs(code)}${commentSuffix}`);
+            continue;
+        }
+
         // Compound block header ending with `:`
         if (code.endsWith(":")) {
             const header = code.slice(0, -1).trimEnd();
@@ -1202,6 +1988,20 @@ export function lavascriptToTs(src: string, tsIndent: string = "    "): string {
             } else if ((kwRest = startsWithKw(header, "for")) !== null) {
                 outLines.push(`${tsIndent.repeat(level)}${emitForInLavaScriptToTs(kwRest)}${commentSuffix}`);
                 stack.push({ level, kind: "normal" });
+            } else if ((kwRest = startsWithKw(header, "with")) !== null) {
+                const asIdx = findTopLevelKeywordLs(kwRest, "as");
+                if (asIdx > 0) {
+                    const exprPart = translateTokensLavaScriptToTs(kwRest.slice(0, asIdx).trim());
+                    const varName = kwRest.slice(asIdx + 2).trim();
+                    outLines.push(`${tsIndent.repeat(level)}{${commentSuffix}`);
+                    outLines.push(`${tsIndent.repeat(level + 1)}const ${varName} = ${exprPart};`);
+                    outLines.push(`${tsIndent.repeat(level + 1)}try {`);
+                    stack.push({ level, kind: "with", withVar: varName });
+                } else {
+                    outLines.push(`${tsIndent.repeat(level)}{${commentSuffix}`);
+                    outLines.push(`${tsIndent.repeat(level + 1)}${translateTokensLavaScriptToTs(kwRest)};`);
+                    stack.push({ level, kind: "with" });
+                }
             } else if (
                 (kwRest = startsWithKw(header, "switch")) !== null ||
                 (kwRest = startsWithKw(header, "match")) !== null
@@ -1224,8 +2024,9 @@ export function lavascriptToTs(src: string, tsIndent: string = "    "): string {
             } else {
                 const fnTs = emitFunctionHeaderLavaScriptToTs(header, inClass);
                 if (fnTs !== null) {
+                    const fnLineIdx = outLines.length;
                     outLines.push(`${tsIndent.repeat(level)}${fnTs}${commentSuffix}`);
-                    stack.push({ level, kind: "normal" });
+                    stack.push({ level, kind: "normal", fnLineIdx });
                 } else {
                     // Check `class`, `interface`, `enum` (with optional `export `)
                     let h = header;
@@ -1272,6 +2073,43 @@ export function lavascriptToTs(src: string, tsIndent: string = "    "): string {
         if (inEnum) {
             const clean = code.endsWith(",") ? code.slice(0, -1).trimEnd() : code;
             outLines.push(`${tsIndent.repeat(level)}${translateTokensLavaScriptToTs(clean)},${commentSuffix}`);
+            continue;
+        }
+
+        // `return expr`, `raise expr`, `del expr`, `yield expr`
+        const retRest = startsWithKw(code, "return");
+        if (retRest !== null) {
+            const retOut = retRest ? `return ${translateTokensLavaScriptToTs(retRest)}` : "return";
+            outLines.push(`${tsIndent.repeat(level)}${retOut};${commentSuffix}`);
+            continue;
+        }
+        const raiseRest = startsWithKw(code, "raise");
+        if (raiseRest !== null) {
+            const raiseExpr = raiseRest ? translateTokensLavaScriptToTs(raiseRest) : "new Error()";
+            outLines.push(`${tsIndent.repeat(level)}throw ${raiseExpr};${commentSuffix}`);
+            continue;
+        }
+        const delRest = startsWithKw(code, "del");
+        if (delRest !== null && delRest !== "") {
+            outLines.push(`${tsIndent.repeat(level)}delete ${translateTokensLavaScriptToTs(delRest)};${commentSuffix}`);
+            continue;
+        }
+        const yieldRest = startsWithKw(code, "yield");
+        if (yieldRest !== null) {
+            for (let fi = stack.length - 1; fi >= 0; fi--) {
+                const fIdx = stack[fi].fnLineIdx;
+                if (fIdx !== undefined) {
+                    outLines[fIdx] = outLines[fIdx].replace(/\bfunction /, "function* ");
+                    break;
+                }
+            }
+            const fromR = startsWithKw(yieldRest, "from");
+            if (fromR !== null && fromR !== "") {
+                outLines.push(`${tsIndent.repeat(level)}yield* ${translateTokensLavaScriptToTs(fromR)};${commentSuffix}`);
+            } else {
+                const yOut = yieldRest ? `yield ${translateTokensLavaScriptToTs(yieldRest)}` : "yield";
+                outLines.push(`${tsIndent.repeat(level)}${yOut};${commentSuffix}`);
+            }
             continue;
         }
 
@@ -1382,6 +2220,14 @@ export function lavascriptToTs(src: string, tsIndent: string = "    "): string {
                     );
                 }
                 continue;
+            } else if (/^[A-Za-z_$][A-Za-z0-9_$,\s]*$/.test(varName) && varName.includes(",") && rhsPart !== null) {
+                const names = splitTopLevel(varName, ",").map((n) => n.trim()).join(", ");
+                const tsType = translateTypeLavaScriptToTs(rawType);
+                const rhsTs = translateTokensLavaScriptToTs(rhsPart);
+                outLines.push(
+                    `${tsIndent.repeat(level)}${expPrefix}${bindKind} [${names}]: ${tsType} = ${rhsTs};${commentSuffix}`
+                );
+                continue;
             }
         } else if (
             rhsPart !== null &&
@@ -1393,6 +2239,18 @@ export function lavascriptToTs(src: string, tsIndent: string = "    "): string {
             const kw = bindKind === "field" ? "" : `${bindKind} `;
             outLines.push(
                 `${tsIndent.repeat(level)}${expPrefix}${staticPrefix}${kw}${lhsPart} = ${rhsTs};${commentSuffix}`
+            );
+            continue;
+        } else if (rhsPart !== null && /^[A-Za-z_$][A-Za-z0-9_$,\s]*$/.test(lhsPart) && lhsPart.includes(",")) {
+            const names = splitTopLevel(lhsPart, ",").map((n) => n.trim()).join(", ");
+            const rhsParts = splitTopLevel(rhsPart, ",");
+            const rhsTs =
+                rhsParts.length > 1
+                    ? `[${rhsParts.map((r) => translateTokensLavaScriptToTs(r.trim())).join(", ")}]`
+                    : translateTokensLavaScriptToTs(rhsPart);
+            const kw = hasExplicitBind || level === 0 ? `${bindKind} ` : "";
+            outLines.push(
+                `${tsIndent.repeat(level)}${expPrefix}${staticPrefix}${kw}[${names}] = ${rhsTs};${commentSuffix}`
             );
             continue;
         }
@@ -1413,6 +2271,28 @@ export function lavascriptToTs(src: string, tsIndent: string = "    "): string {
 
     while (stack.length > 0) {
         closeFrame(stack.pop()!);
+    }
+
+    if (gLsCtx.usedInHelper) {
+        outLines.push(
+            "",
+            "function _lsIn(c: any, k: any): boolean {",
+            `${tsIndent}if (c instanceof Set || c instanceof Map) return c.has(k);`,
+            `${tsIndent}if (Array.isArray(c) || typeof c === "string") return c.includes(k);`,
+            `${tsIndent}return c != null && Object.prototype.hasOwnProperty.call(c, k);`,
+            "}"
+        );
+    }
+    if (gLsCtx.usedZipHelper) {
+        outLines.push(
+            "",
+            "function _lsZip<A, B>(a: A[], b: B[]): [A, B][] {",
+            `${tsIndent}const n = Math.min(a.length, b.length);`,
+            `${tsIndent}const out: [A, B][] = [];`,
+            `${tsIndent}for (let i = 0; i < n; i++) out.push([a[i], b[i]]);`,
+            `${tsIndent}return out;`,
+            "}"
+        );
     }
 
     return outLines.join("\n") + "\n";
@@ -2031,6 +2911,55 @@ def describe(kind: ShapeKind) -> str:
             console.error(
                 `FAIL [comprehensions LavaScript roundtrip]\n--- Expected ---\n${compLs}--- Got ---\n${gotLs}`
             );
+            return 1;
+        }
+        passed++;
+    }
+
+    // Extended Pythonic syntax test (validated + executed)
+    {
+        const pyLs = `def gen_vals(n: num):
+    for i in range(0, n, 2):
+        yield i
+
+def test_pythonic() -> num:
+    multi = """hello
+world"""
+    nums: list[num] = [
+        x + y
+        for x in range(0, 4, 2)
+        for y in range(2)
+        if x + y > 0
+    ]
+    inc = lambda x: num -> num: x + 1
+    tag: str = "yes" if 2 in nums and 9 not in nums else "no"
+    ok_chain: bool = 0 < nums[0] < 10 and not 5 == 6 and tag is not nil
+    msg: str = f"tag={tag} {{ok}} {3.14159:.2f}"
+    a, b = 10, 20
+    a, b = b, a
+    floor_v: num = -7 // 2
+    last_v: num = nums[-1]
+    sliced: list[num] = nums[1:3]
+    is_s: bool = isinstance(msg, str)
+    var pairs: list[num] = []
+    for i, v in enumerate(sliced):
+        pairs.push(i + v)
+    for x, y in zip([1, 2], [3, 4]):
+        pairs.push(x + y)
+    for r in reversed([1, 2]):
+        pairs.push(r)
+    gen_sum: num = 0
+    for g in gen_vals(6):
+        gen_sum += g
+    with { close: lambda (): nil } as res:
+        _ = res
+    if ok_chain and is_s and multi.includes("\\n"):
+        return inc(a) + b + floor_v + last_v + gen_sum + pairs.length
+    raise new Error("unreachable")
+`;
+        const tsOut = lavascriptToTs(pyLs);
+        if (!tsOut.includes("function* gen_vals") || !tsOut.includes("Math.floor((-7) / (2))")) {
+            console.error("FAIL [pythonic syntax TS output]:\n" + tsOut);
             return 1;
         }
         passed++;
