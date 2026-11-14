@@ -338,15 +338,3 @@ Measured on a 250-function synthetic module (`./lavascript --bench`):
 | **Transpilation speed (LavaScript 4-space → TS)** | **~375 files/s** (`30.0 MiB/s`) |
 | **Transpilation speed (LavaScript tab → TS)** | **~385 files/s** (`26.5 MiB/s`) |
 | **Reverse conversion (TS → LavaScript)** | **~285 files/s** (`26.8 MiB/s`) |
-
----
-
-## Repository Layout
-
-- [`lavascript.ts`](lavascript.ts) — Single-file bidirectional LavaScript ↔ TypeScript transpiler, runner, formatter, test suite, and benchmark.
-- [`examples/hello.ls`](examples/hello.ls) — Introductory example (`def`, `range`, list comprehension, `f"..."`, `and`/`or`/`not`).
-- [`examples/shapes.ls`](examples/shapes.ls) — `enum`, `interface`, `class`, methods, and `switch`/`case`.
-- [`examples/comprehensions.ls`](examples/comprehensions.ls) — List, Set, Map (`dict`), and Record (`rec`) comprehensions.
-- [`examples/tabs.ls`](examples/tabs.ls) — Tab-indented (`\t`) Fibonacci example demonstrating auto-detected tab indentation.
-- [`Makefile`](Makefile) — Build, test, benchmark, and install targets.
-- [`LICENSE`](LICENSE) — MIT License.
